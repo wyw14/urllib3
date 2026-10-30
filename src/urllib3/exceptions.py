@@ -78,6 +78,29 @@ class ProtocolError(HTTPError):
 ConnectionError = ProtocolError
 
 
+class DigestMismatchError(HTTPError):
+    """Raised when a fully-read response body's digest does not match the
+    digest expected by the caller.
+
+    The mismatch is only detected once the complete body has been read, so
+    this exception is raised at the end of iteration by
+    :meth:`urllib3.response.HTTPResponse.stream_verified`. Chunks that were
+    yielded before the mismatch was detected must not be treated as
+    verified.
+
+    :param expected_digest: The hexadecimal digest expected by the caller.
+    :param actual_digest: The hexadecimal digest computed over the body.
+    """
+
+    def __init__(self, expected_digest: str, actual_digest: str) -> None:
+        self.expected_digest = expected_digest
+        self.actual_digest = actual_digest
+        super().__init__(
+            "Response body digest mismatch: expected "
+            f"{expected_digest}, got {actual_digest}"
+        )
+
+
 # Leaf Exceptions
 
 

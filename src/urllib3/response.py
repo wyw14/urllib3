@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import collections
+import hashlib
+import hmac
 import io
 import json as _json
 import logging
@@ -34,6 +36,7 @@ from .exceptions import (
     BodyNotHttplibCompatible,
     DecodeError,
     DependencyWarning,
+    DigestMismatchError,
     HTTPError,
     IncompleteRead,
     InvalidChunkLength,
@@ -58,6 +61,9 @@ _READ_CHUNK_SIZE = 2**16
 # int() is more permissive, so we match against the grammar before calling it.
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 _CHUNK_SIZE_RE = re.compile(rb"[0-9A-Fa-f]+")
+
+# A SHA-256 digest encoded as 64 hexadecimal characters.
+_SHA256_HEXDIGEST_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 # Maximum length of a chunk-size line (and the trailing CRLF line) when reading a
 # chunked-transfer-encoded response. Matches ``http.client._MAXLINE`` so urllib3's
@@ -593,6 +599,11 @@ class BaseHTTPResponse(io.IOBase):
 
     def stream(
         self, amt: int | None = _READ_CHUNK_SIZE, decode_content: bool | None = None
+    ) -> typing.Iterator[bytes]:
+        raise NotImplementedError()
+
+    def stream_verified(
+        self, expected_sha256: str, chunk_size: int
     ) -> typing.Iterator[bytes]:
         raise NotImplementedError()
 
@@ -1312,6 +1323,55 @@ class HTTPResponse(BaseHTTPResponse):
                 if data:
                     yield data
 
+    def stream_verified(self, expected_sha256: str, chunk_size: int) -> VerifiedStream:
+        """
+        Iterate over the *decoded* response body while incrementally
+        verifying its SHA-256 digest against ``expected_sha256``.
+
+        Yields the same decoded bytes, in the same order, as
+        ``stream(chunk_size, decode_content=True)``. The SHA-256 digest is
+        updated incrementally with each yielded chunk, so the complete body
+        is never gathered in memory.
+
+        The body chunks produced while iterating are **not** verified until
+        the iteration reaches the end of the body: the returned
+        :class:`VerifiedStream`'s :attr:`~VerifiedStream.verified` attribute
+        becomes ``True`` only after the full body has been read to EOF and
+        its digest matches. If the digests differ,
+        :class:`~urllib3.exceptions.DigestMismatchError` is raised when
+        iteration ends; data already yielded must not be treated as
+        verified. Abandoning the iteration (closing the iterator, breaking
+        out of the loop, or a read error) leaves ``verified`` as ``False``;
+        the unread remainder is not drained, retried, or treated as
+        complete data.
+
+        The expected digest is always the one supplied by the caller;
+        digest-like response headers are never consulted.
+
+        The response must still be completely unread and must not have been
+        preloaded or cached (request it with ``preload_content=False``).
+
+        :param expected_sha256:
+            The expected SHA-256 digest as a string of 64 hexadecimal
+            characters, obtained by the caller out-of-band.
+
+        :param chunk_size:
+            A positive integer indicating how much decoded content the
+            iterator should produce at most per iteration.
+
+        :raises ValueError:
+            If ``expected_sha256`` is not 64 hexadecimal characters or
+            ``chunk_size`` is not positive. Raised before any response data
+            is read.
+        :raises TypeError:
+            If ``chunk_size`` is not an integer. Raised before any response
+            data is read.
+        :raises RuntimeError:
+            If the response has already been preloaded, cached, partially
+            consumed, or closed. Raised before any response data is read.
+        """
+        return VerifiedStream(self, expected_sha256, chunk_size)
+
     # Overrides from io.IOBase
     def readable(self) -> bool:
         return True
@@ -1546,3 +1606,135 @@ class HTTPResponse(BaseHTTPResponse):
                 buffer.append(chunk)
         if buffer:
             yield b"".join(buffer)
+
+
+class VerifiedStream(typing.Iterator[bytes]):
+    """
+    Iterator returned by :meth:`HTTPResponse.stream_verified`.
+
+    Produces the *decoded* response body in chunks, exactly like iterating
+    ``HTTPResponse.stream(..., decode_content=True)``, while updating a
+    SHA-256 hash incrementally with every produced chunk. The complete
+    response body is never buffered by this iterator.
+
+    The chunks produced while iterating are **not** verified until the
+    iteration reaches the end of the body. :attr:`verified` becomes
+    ``True`` only after the whole body has been read to EOF *and* its
+    digest matches the digest supplied by the caller. If the digests
+    differ, :class:`~urllib3.exceptions.DigestMismatchError` is raised when
+    the iterator is advanced past the final chunk; chunks produced before
+    that point must not be treated as verified.
+
+    Abandoning the iteration early (calling :meth:`close`, breaking out of
+    the loop and discarding this iterator, or a read error) leaves
+    :attr:`verified` as ``False``. The unread remainder of the response is
+    neither treated as complete data, drained, nor retried; release or
+    close the response as usual when giving up on a body.
+    """
+
+    def __init__(
+        self,
+        response: HTTPResponse,
+        expected_sha256: str,
+        chunk_size: int,
+    ) -> None:
+        # Validate the arguments before the response can be consumed in
+        # any way: a rejected call must not read a single body byte.
+        if not isinstance(expected_sha256, str) or not _SHA256_HEXDIGEST_RE.fullmatch(
+            expected_sha256
+        ):
+            raise ValueError(
+                "expected_sha256 must be the SHA-256 digest as a string of "
+                "64 hexadecimal characters"
+            )
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise TypeError("chunk_size must be a positive integer")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+        # The digest can only cover the whole decoded body if nothing has
+        # touched it yet: reject preloaded, cached, partially consumed and
+        # already closed responses.
+        if response._body is not None:
+            raise RuntimeError(
+                "stream_verified() requires a response that has not been "
+                "preloaded or cached. Request the response with "
+                "preload_content=False and do not access .data or read "
+                "(with caching) before calling stream_verified()."
+            )
+        if (
+            response._uncached_read_occurred
+            or response._has_decoded_content
+            or response._fp_bytes_read > 0
+            or len(response._decoded_buffer) > 0
+        ):
+            raise RuntimeError(
+                "stream_verified() requires a response whose body has not "
+                "been partially consumed yet."
+            )
+        if response._fp is None or is_fp_closed(response._fp):
+            raise RuntimeError(
+                "stream_verified() requires an open response with an unread body."
+            )
+
+        self._response = response
+        self._expected_digest = expected_sha256.lower()
+        self._hasher = hashlib.sha256()
+        # ``stream()`` is a generator function, so merely creating it does
+        # not read or otherwise consume the response.
+        self._stream = response.stream(chunk_size, decode_content=True)
+        self._finished = False
+        self._closed = False
+        self._verified = False
+
+    def __iter__(self) -> VerifiedStream:
+        return self
+
+    def __next__(self) -> bytes:
+        if self._finished or self._closed:
+            raise StopIteration
+        try:
+            chunk = next(self._stream)
+        except StopIteration:
+            # The complete body was read to EOF, so the digest can now be
+            # judged. Read errors propagate from next() above and leave the
+            # stream unfinished and unverified.
+            self._finished = True
+            actual_digest = self._hasher.hexdigest()
+            if hmac.compare_digest(actual_digest, self._expected_digest):
+                self._verified = True
+                raise
+            raise DigestMismatchError(self._expected_digest, actual_digest)
+        except BaseException:
+            # A failed or externally closed body stream can never reach a
+            # meaningful verdict: stay unverified and end like any closed
+            # iterator if advanced again, instead of comparing a partial
+            # digest.
+            self._finished = True
+            raise
+        self._hasher.update(chunk)
+        return chunk
+
+    @property
+    def verified(self) -> bool:
+        """
+        Whether the complete body has been read to EOF and its SHA-256
+        digest matched the expected value. ``False`` while iteration is in
+        progress, after it was abandoned, or after a digest mismatch.
+        """
+        return self._verified
+
+    def close(self) -> None:
+        """
+        Stop verifying before the body has been read to EOF.
+
+        Marks the stream as not verified without reading, draining, or
+        retrying the unread remainder, and closes the underlying body
+        stream. Discarding a suspended iterator without calling this method
+        has the same effect on the underlying stream (its generator is
+        closed on deallocation), but calling it explicitly is preferred.
+        """
+        if self._finished or self._closed:
+            return
+        self._closed = True
+        self._stream.close()

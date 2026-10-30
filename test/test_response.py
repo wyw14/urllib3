@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import http.client as httplib
 import socket
 import ssl
@@ -19,6 +20,7 @@ import pytest
 from urllib3.exceptions import (
     BodyNotHttplibCompatible,
     DecodeError,
+    DigestMismatchError,
     IncompleteRead,
     InvalidChunkLength,
     InvalidHeader,
@@ -32,6 +34,7 @@ from urllib3.response import (  # type: ignore[attr-defined]
     BytesQueueBuffer,
     GzipDecoder,
     HTTPResponse,
+    VerifiedStream,
     brotli,
 )
 from urllib3.util.response import is_fp_closed
@@ -2203,6 +2206,350 @@ class TestResponse:
             resp = HTTPResponse(fp, status=204)
             resp.read(16)
         assert "Response may not contain content" in str(excinfo.value)
+
+
+def _gzip_stream_chunks(body: bytes, wire_chunk_size: int = 2) -> list[bytes]:
+    compressed = gzip.compress(body)
+    return [
+        compressed[i : i + wire_chunk_size]
+        for i in range(0, len(compressed), wire_chunk_size)
+    ]
+
+
+def _chunked_http_response(
+    chunks: list[bytes], extra_headers: dict[str, str] | None = None
+) -> tuple[httplib.HTTPResponse, HTTPResponse]:
+    fp = MockChunkedEncodingResponse(chunks)
+    r = httplib.HTTPResponse(MockSock, method="GET")  # type: ignore[arg-type]
+    r.fp = fp  # type: ignore[assignment]
+    headers: dict[str, str] = {"transfer-encoding": "chunked"}
+    if extra_headers is not None:
+        headers.update(extra_headers)
+    resp = HTTPResponse(
+        r,
+        preload_content=False,
+        headers=headers,
+        original_response=r,
+    )
+    return r, resp
+
+
+class TestStreamVerified:
+    def test_returns_verified_stream_iterator(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"), preload_content=False)
+        stream = resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+        assert isinstance(stream, VerifiedStream)
+        assert iter(stream) is stream
+        assert stream.verified is False
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 16, 64, 10_000])
+    def test_plain_body(self, chunk_size: int) -> None:
+        body = bytes(range(256)) * 4
+        resp = HTTPResponse(BytesIO(body), preload_content=False)
+        stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), chunk_size)
+
+        assert stream.verified is False
+        received = b"".join(stream)
+        assert received == body
+        assert stream.verified is True
+        # The body must not be cached/gathered by the response.
+        assert resp._body is None
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 37])
+    def test_gzipped_body_hashes_decoded_bytes(self, chunk_size: int) -> None:
+        body = b"the quick brown fox " * 100
+        resp = HTTPResponse(
+            BytesIO(gzip.compress(body)),
+            headers={"content-encoding": "gzip"},
+            preload_content=False,
+        )
+        stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), chunk_size)
+        received = b"".join(stream)
+
+        assert received == body
+        assert stream.verified is True
+        # A digest of the still-compressed wire bytes must not match.
+        assert (
+            hashlib.sha256(gzip.compress(body)).hexdigest()
+            != hashlib.sha256(body).hexdigest()
+        )
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 13])
+    def test_chunked_body(self, chunk_size: int) -> None:
+        chunks = [b"fo", b"o", b"bar" * 100]
+        body = b"".join(chunks)
+        _, resp = _chunked_http_response(chunks)
+        stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), chunk_size)
+
+        assert b"".join(stream) == body
+        assert stream.verified is True
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 5])
+    def test_chunked_and_gzipped_body(self, chunk_size: int) -> None:
+        body = b"foobar" * 50
+        _, resp = _chunked_http_response(
+            _gzip_stream_chunks(body), {"content-encoding": "gzip"}
+        )
+        stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), chunk_size)
+
+        assert b"".join(stream) == body
+        assert stream.verified is True
+
+    def test_empty_body_matches(self) -> None:
+        resp = HTTPResponse(BytesIO(b""), preload_content=False)
+        stream = resp.stream_verified(hashlib.sha256(b"").hexdigest(), 64)
+
+        assert list(stream) == []
+        assert stream.verified is True
+
+    def test_digest_mismatch_raises_at_end_of_iteration(self) -> None:
+        body = b"foo" * 100
+        expected_digest = "0" * 64
+        resp = HTTPResponse(BytesIO(body), preload_content=False)
+        stream = resp.stream_verified(expected_digest, 16)
+
+        # All chunks are still produced; they are merely not verified yet.
+        received: list[bytes] = []
+        with pytest.raises(DigestMismatchError) as exc_info:
+            for chunk in stream:
+                assert stream.verified is False
+                received.append(chunk)
+
+        assert b"".join(received) == body
+        assert stream.verified is False
+        error = exc_info.value
+        assert error.expected_digest == expected_digest
+        assert error.actual_digest == hashlib.sha256(body).hexdigest()
+        assert expected_digest in str(error)
+        assert error.actual_digest in str(error)
+        # Iterating again after the mismatch simply ends.
+        assert list(stream) == []
+
+    def test_digest_mismatch_on_empty_body(self) -> None:
+        resp = HTTPResponse(BytesIO(b""), preload_content=False)
+        stream = resp.stream_verified("0" * 64, 8)
+
+        with pytest.raises(DigestMismatchError) as exc_info:
+            next(stream)
+        assert stream.verified is False
+        assert exc_info.value.actual_digest == hashlib.sha256(b"").hexdigest()
+
+    def test_uppercase_digest_accepted(self) -> None:
+        body = b"foo"
+        resp = HTTPResponse(BytesIO(body), preload_content=False)
+        digest = hashlib.sha256(body).hexdigest().upper()
+        stream = resp.stream_verified(digest, 8)
+
+        assert b"".join(stream) == body
+        assert stream.verified is True
+
+    def test_chunks_match_stream_decode_content(self) -> None:
+        body = bytes(range(256)) * 4
+        reference = HTTPResponse(BytesIO(body), preload_content=False)
+        verified = HTTPResponse(BytesIO(body), preload_content=False)
+
+        reference_chunks = list(reference.stream(37, decode_content=True))
+        verified_stream = verified.stream_verified(hashlib.sha256(body).hexdigest(), 37)
+        verified_chunks = list(verified_stream)
+
+        # Same decoded bytes, in the same chunks, in the same order.
+        assert verified_chunks == reference_chunks
+        assert b"".join(verified_chunks) == body
+        assert verified_stream.verified is True
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 64, 1000])
+    def test_gzipped_chunks_match_stream_decode_content(self, chunk_size: int) -> None:
+        body = bytes(range(256)) * 4
+        compressed = gzip.compress(body)
+        reference = HTTPResponse(
+            BytesIO(compressed),
+            headers={"content-encoding": "gzip"},
+            preload_content=False,
+        )
+        verified = HTTPResponse(
+            BytesIO(compressed),
+            headers={"content-encoding": "gzip"},
+            preload_content=False,
+        )
+
+        reference_body = b"".join(reference.stream(chunk_size, decode_content=True))
+        verified_stream = verified.stream_verified(
+            hashlib.sha256(body).hexdigest(), chunk_size
+        )
+        verified_body = b"".join(verified_stream)
+
+        assert reference_body == body
+        assert verified_body == body
+        assert verified_stream.verified is True
+
+    def test_break_early_is_not_verified_and_not_drained(self) -> None:
+        body = b"x" * 100
+        resp = HTTPResponse(BytesIO(body), preload_content=False)
+        stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), 10)
+
+        assert next(stream) == b"x" * 10
+        stream.close()
+
+        assert stream.verified is False
+        # A closed iterator simply ends, never reporting a partial-digest
+        # mismatch.
+        with pytest.raises(StopIteration):
+            next(stream)
+        # No retry/drain: the unread remainder was never consumed.
+        assert resp.tell() < len(body)
+        # Idempotent.
+        stream.close()
+        assert stream.verified is False
+
+    def test_discarding_iterator_is_not_verified(self) -> None:
+        body = b"y" * 100
+        resp = HTTPResponse(BytesIO(body), preload_content=False)
+        stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), 10)
+        next(stream)
+        del stream
+
+        # Giving up on the iterator must not read the body to completion.
+        assert resp.tell() < len(body)
+
+    def test_closing_chunked_stream_releases_without_verifying(self) -> None:
+        chunks = [b"ab", b"cd", b"ef"]
+        httplib_response, resp = _chunked_http_response(chunks)
+        stream = resp.stream_verified(hashlib.sha256(b"abcdef").hexdigest(), 2)
+
+        assert next(stream) == b"ab"
+        stream.close()
+
+        assert stream.verified is False
+        assert httplib_response.isclosed()
+
+    def test_read_error_is_not_verified(self) -> None:
+        body = b"foo" * 100
+        fp = BytesIO(body)
+        with mock.patch.object(fp, "read", side_effect=OSError("boom")):
+            resp = HTTPResponse(fp, preload_content=False)
+            stream = resp.stream_verified(hashlib.sha256(body).hexdigest(), 16)
+            with pytest.raises(ProtocolError, match="boom"):
+                next(stream)
+            assert stream.verified is False
+            # The failed stream never reports success or a partial-digest
+            # mismatch afterwards.
+            with pytest.raises(StopIteration):
+                next(stream)
+            assert stream.verified is False
+
+    @pytest.mark.parametrize(
+        "bad_digest",
+        [
+            "",
+            "0" * 63,
+            "0" * 65,
+            "g" * 64,
+            "z" * 64,
+            " " * 64,
+            "a" * 63 + " ",
+            b"0" * 64,
+            123,
+            None,
+        ],
+    )
+    def test_invalid_digest_rejected_before_consuming_response(
+        self, bad_digest: typing.Any
+    ) -> None:
+        fp = BytesIO(b"foo")
+        resp = HTTPResponse(fp, preload_content=False)
+
+        with pytest.raises(ValueError):
+            resp.stream_verified(bad_digest, 8)
+
+        # The rejection happened before consuming the body, so the
+        # response is still fully readable through the regular API.
+        assert resp.tell() == 0
+        assert resp.read() == b"foo"
+
+    @pytest.mark.parametrize(
+        "bad_chunk_size", [0, -1, -65536, 1.5, 2.0, "8", True, False, None]
+    )
+    def test_invalid_chunk_size_rejected_before_consuming_response(
+        self, bad_chunk_size: typing.Any
+    ) -> None:
+        fp = BytesIO(b"foo")
+        resp = HTTPResponse(fp, preload_content=False)
+        digest = hashlib.sha256(b"foo").hexdigest()
+
+        with pytest.raises((TypeError, ValueError)):
+            resp.stream_verified(digest, bad_chunk_size)
+
+        assert resp.tell() == 0
+        assert resp.read() == b"foo"
+
+    def test_preloaded_response_rejected(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"))
+        with pytest.raises(RuntimeError, match="preloaded or cached"):
+            resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+
+    def test_in_memory_body_rejected(self) -> None:
+        resp = HTTPResponse(b"foo")
+        with pytest.raises(RuntimeError, match="preloaded or cached"):
+            resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+
+    def test_partially_read_response_rejected(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"), preload_content=False)
+        assert resp.read(2) == b"fo"
+
+        with pytest.raises(RuntimeError, match="partially consumed"):
+            resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+
+    def test_partially_streamed_response_rejected(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"), preload_content=False)
+        partial = resp.stream(1, decode_content=False)
+        assert next(partial) == b"f"
+
+        with pytest.raises(RuntimeError, match="partially consumed"):
+            resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+
+    def test_cached_response_rejected(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"), preload_content=False)
+        resp.read(cache_content=True)
+
+        with pytest.raises(RuntimeError, match="preloaded or cached"):
+            resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+
+    def test_closed_response_rejected(self) -> None:
+        resp = HTTPResponse(BytesIO(b"foo"), preload_content=False)
+        resp.close()
+
+        with pytest.raises(RuntimeError, match="open response"):
+            resp.stream_verified(hashlib.sha256(b"foo").hexdigest(), 8)
+
+    def test_server_digest_headers_are_not_trusted(self) -> None:
+        body = b"foo"
+        server_digest = "0" * 64
+
+        # A bogus server digest header must be ignored when the caller's
+        # digest matches.
+        resp = HTTPResponse(
+            BytesIO(body),
+            preload_content=False,
+            headers={
+                "digest": "sha-256=AAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "x-checksum-sha256": server_digest,
+            },
+        )
+        matching = resp.stream_verified(hashlib.sha256(body).hexdigest(), 8)
+        assert b"".join(matching) == body
+        assert matching.verified is True
+
+        # ...and a matching server header cannot save a mismatching caller
+        # digest.
+        resp = HTTPResponse(
+            BytesIO(body),
+            preload_content=False,
+            headers={"x-checksum-sha256": hashlib.sha256(body).hexdigest()},
+        )
+        mismatching = resp.stream_verified("1" * 64, 8)
+        with pytest.raises(DigestMismatchError):
+            list(mismatching)
+        assert mismatching.verified is False
 
 
 class MockChunkedEncodingResponse:
